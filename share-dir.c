@@ -7,14 +7,7 @@
 #include <openssl/sha.h>
 #include <sys/stat.h>
 #include <libgen.h>
-
-//
-// utilities
-//
-void diep(char *str) {
-    perror(str);
-    exit(EXIT_FAILURE);
-}
+#include "losha.h"
 
 //
 // json dumps
@@ -23,7 +16,7 @@ static void dump(json_t *root) {
     char *data = NULL;
     
     if(!(data = json_dumps(root, JSON_INDENT(4)))) {
-        printf("[-] cannot dump json\n");
+        fprintf(stderr, "[-] cannot dump json\n");
         return;
     }
     
@@ -66,7 +59,7 @@ char *finalize(char *buffer, size_t chunksz) {
     SHA1((unsigned char *) buffer, chunksz, hash);
     buff = _gethash(hash);
     
-    printf("[+] chunk checksum: %s\n", buff);
+    debug("[+] chunk checksum: %s\n", buff);
     
     return buff;
 }
@@ -141,7 +134,7 @@ static void listdir(const char *root, const char *name, json_t *objects) {
         } else {
             // skip too long names
             if(strlen(name) + strlen(entry->d_name) + 2 > sizeof(temp)) {
-                printf("[-] filename too long, this will cause errors.\n");
+                fprintf(stderr, "[-] filename too long, this will cause errors.\n");
                 return;
             }
             
@@ -208,7 +201,7 @@ json_t *chunks(char *root, const char **files, size_t length, size_t chunksz) {
         
         if(load + fst.st_size <= chunksz) {
             // the file fill in this chunk
-            printf("[+] buffering [%lu]: %s\n", fst.st_size, absolute);
+            debug("[+] buffering [%lu]: %s\n", fst.st_size, absolute);
             bufferise(buffer + load, absolute, fst.st_size, 0);
             
             load += fst.st_size;
@@ -225,7 +218,7 @@ json_t *chunks(char *root, const char **files, size_t length, size_t chunksz) {
                 if(diff > fst.st_size - temp)
                     diff = fst.st_size - temp;
                 
-                printf("[+] buffering (partial): [%lu -> %lu / %lu] %s\n", temp, diff + temp, fst.st_size, absolute);
+                debug("[+] buffering (partial): [%lu -> %lu / %lu] %s\n", temp, diff + temp, fst.st_size, absolute);
                 
                 bufferise(buffer + load, absolute, diff, 0);
                 load += diff;
@@ -244,37 +237,44 @@ json_t *chunks(char *root, const char **files, size_t length, size_t chunksz) {
         }
     }
     
+    free(buffer);
+    
     return ochunks;
 }
 
 //
 // sharing root
 //
-int sharing(char *path) {
+const char *sharing(char *path) {
     const char **ordered;
+    const char *json, *xjson;
     const char *id = NULL;           // descriptor id
     json_t *objects = json_object(); // file
     json_t *ochunks = NULL;          // ordered chunks
     json_t *root;                    // final dumps
     size_t chuksz = 4 * 1024 * 1024; // 4 MiB
     size_t length;
-    size_t index;
+    
+    fprintf(stderr, "[+] sharing: %s\n", path);
 
     // load directory content
     listdir(path, path, objects);
     length = json_object_size(objects);
-    dump(objects);
     
+    if(__debug)
+        dump(objects);
+
     // ordering the files list
-    printf("[+] ordering files names\n");
+    debug("[+] ordering files names\n");
     ordered = order(objects);
-    
+
+    /*
     for(index = 0; index < length; index++)
-        printf(">> %s\n", ordered[index]);
-    
+        debug(">> %s\n", ordered[index]);
+    */
+
     // computing chunks hash
     ochunks = chunks(path, ordered, length, chuksz);
-    dump(ochunks);
     
     // building the id from chunks
     id = identifier(ochunks);
@@ -286,7 +286,14 @@ int sharing(char *path) {
     json_object_set_new(root, "files", objects);
     json_object_set_new(root, "chunks", ochunks);
     
-    dump(root);
+    if(!(json = json_dumps(root, JSON_INDENT(4))))
+        dies("json failed");
     
-    return 0;
+    // clearing
+    json_decref(root);
+
+    free(ordered);
+    free((char *) id);
+    
+    return json;
 }
