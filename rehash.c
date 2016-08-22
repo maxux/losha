@@ -39,26 +39,6 @@ static char *finalize(char *buffer, size_t chunksz) {
     return buff;
 }
 
-static const char *identifier(json_t *root) {
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    const char *key, *buff;
-    SHA_CTX ctx;
-    size_t index;
-    json_t *value;
-    
-    SHA1_Init(&ctx);
-    
-    json_array_foreach(root, index, value) {
-        key = json_string_value(value);
-        SHA1_Update(&ctx, key, strlen(key));
-    }
-    
-    SHA1_Final(hash, &ctx);
-    buff = _gethash(hash);
-    
-    return buff;
-}
-
 //
 // files list
 //
@@ -84,56 +64,44 @@ static const char **order(json_t *root) {
     return data;
 }
 
-static void listdir(const char *root, const char *name, json_t *objects) {
-    struct dirent *entry;
-    struct stat fst;
-    char temp[2048];
-    json_t *size;
-    DIR *dir;
-
-    if(!(dir = opendir(name)))
-        return;
-
-    while((entry = readdir(dir))) {
-        if(entry->d_type == DT_DIR) {
-            char path[1024];
-
-            int len = snprintf(path, sizeof(path) - 1, "%s/%s", name, entry->d_name);
-            path[len] = 0;
-            
-            if(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-                continue;
-
-            listdir(root, path, objects);
-
-        } else {
-            // skip too long names
-            if(strlen(name) + strlen(entry->d_name) + 2 > sizeof(temp)) {
-                fprintf(stderr, "[-] filename too long, this will cause errors.\n");
-                return;
-            }
-            
-            sprintf(temp, "%s/%s", name, entry->d_name);
-            
-            if(stat(temp, &fst) < 0)    
-                diep("stat");
-            
-            size = json_integer(fst.st_size);
-
-            if(strcmp(root, name) != 0) {
-                sprintf(temp, "%s/%s", name + strlen(root) + 1, entry->d_name);
-                json_object_set_new(objects, temp, size);
-                
-            } else json_object_set_new(objects, entry->d_name, size);
-        }
-    }
-
-    closedir(dir);
-}
-
 //
 // chunks tools
 //
+static json_t *chunkof(char *filename, const char **files, json_t *objects, json_t *ochunks, size_t chunksz) {
+    size_t length = json_object_size(objects);
+    json_t *hashs = json_array();
+    size_t index;
+    size_t skipped = 0;
+    json_t *key;
+    int size;
+    
+    for(index = 0; index < length; index++) {
+        key = json_object_get(objects, files[index]);
+        size = json_integer_value(key);
+        
+        // filename match
+        if(strcmp(files[index], filename) == 0) {
+            size_t init = skipped / chunksz;
+            size_t rest = skipped % chunksz;
+            
+            // adding all chunks corresponding
+            do {
+                key = json_array_get(ochunks, init);
+                json_array_append(hashs, key);
+                
+                size -= (chunksz - rest);
+                
+                rest = 0;  // no place left on the chunk
+                init += 1; // next chunk
+
+            } while(size > 0);
+
+        } else skipped += size;
+    }
+    
+    return hashs;
+}
+
 static int bufferise(char *buffer, char *file, size_t size, size_t offset) {
     FILE *fp;
     
@@ -151,8 +119,31 @@ static int bufferise(char *buffer, char *file, size_t size, size_t offset) {
     return size;
 }
 
-static json_t *chunks(char *root, const char **files, size_t length, size_t chunksz) {
-    json_t *ochunks = json_array();
+static int sizes(char *root, const char **files, size_t length, json_t *objects, size_t chunksz) {
+    char absolute[2048];
+    size_t index;
+    struct stat fst;
+    json_t *size;
+    int corrupted = 0;
+    
+    for(index = 0; index < length; index++) {
+        sprintf(absolute, "%s/%s", root, files[index]);
+
+        if(stat(absolute, &fst) < 0)
+            diep("stat");
+        
+        size = json_object_get(objects, files[index]);
+        
+        if(fst.st_size != (size_t) json_integer_value(size)) {
+            printf("[-] filesize '%s' is incorrect\n", files[index]);
+            corrupted += 1;
+        }
+    }
+    
+    return 0;
+}
+
+static int chunks(char *root, const char **files, size_t length, size_t chunksz, json_t *ochunks) {
     char absolute[2048];
     struct stat fst;
     char *buffer = NULL;
@@ -161,6 +152,10 @@ static json_t *chunks(char *root, const char **files, size_t length, size_t chun
     size_t load = 0;
     size_t diff = 0;
     size_t temp = 0;
+    size_t chunkdx = 0;
+    const char *key;
+    json_t *item;
+    int corrupted = 0;
     
     if(!(buffer = malloc(chunksz)))
         diep("malloc");
@@ -199,13 +194,23 @@ static json_t *chunks(char *root, const char **files, size_t length, size_t chun
                 load += diff;
                 temp += diff;
             
-                // chunk is full, checksum
+                // chunk is full, compare checksum
                 if(load == chunksz) {
                     hex = finalize(buffer, chunksz);
                     
-                    json_array_append_new(ochunks, json_string(hex));
+                    if(!(item = json_array_get(ochunks, chunkdx)))
+                        dies("json out of bounds");
+                        
+                    key = json_string_value(item);
+                    
+                    if(strcmp(hex, key)) {
+                        printf("[-] chunk %lu (%s) seems currupted\n", chunkdx, key);
+                        corrupted += 1;
+                    }
+                    
                     free(hex);
                     
+                    chunkdx += 1;
                     load = 0;
                 }
             }
@@ -214,61 +219,59 @@ static json_t *chunks(char *root, const char **files, size_t length, size_t chun
     
     free(buffer);
     
-    return ochunks;
+    return corrupted;
 }
 
 //
 // sharing root
 //
-const char *sharing(char *path) {
+int rehash(char *target, char *input) {
     const char **ordered;
-    const char *json;
-    const char *id = NULL;            // descriptor id
     json_t *objects = json_object();  // file
     json_t *ochunks = NULL;           // ordered chunks
+    json_t *temp = NULL;
     json_t *root;                     // final dumps
+    json_error_t error;
     size_t chunksz = 4 * 1024 * 1024; // 4 MiB
     size_t length;
+    int corrupted;
     
-    fprintf(stderr, "[+] sharing: %s\n", path);
+    fprintf(stderr, "[+] rehash: %s with %s\n", target, input);
+    
+    if(!(root = json_load_file(input, 0, &error)))
+        dies(error.text);
 
-    // load directory content
-    listdir(path, path, objects);
+    temp = json_object_get(root, "name");
+    printf("[+] share name: %s\n", json_string_value(temp));
+    
+    temp = json_object_get(root, "id");
+    printf("[+] share unique id: %s\n", json_string_value(temp));
+    
+    
+    printf("[+] preparing files list\n");
+    objects = json_object_get(root, "files");
+    
     length = json_object_size(objects);
-    
-    if(__debug)
-        json_dump_object(objects);
-
-    // ordering the files list
-    debug("[+] ordering files names\n");
     ordered = order(objects);
-
+    
+    ochunks = json_object_get(root, "chunks");
+    
     /*
     for(index = 0; index < length; index++)
         debug(">> %s\n", ordered[index]);
     */
-
-    // computing chunks hash
-    ochunks = chunks(path, ordered, length, chunksz);
     
-    // building the id from chunks
-    id = identifier(ochunks);
+    char *x = "Island/Media/Texture/Image/IslandTransition.dds";
+    chunkof(x, ordered, objects, ochunks, chunksz);
+    exit(0);
     
-    // building losha-descriptor
-    root = json_object();
-    json_object_set_new(root, "id", json_string(id));
-    json_object_set_new(root, "name", json_string(basename(path)));
-    json_object_set_new(root, "files", objects);
-    json_object_set_new(root, "chunks", ochunks);
+    printf("[+] checking local directory file sizes\n");
+    corrupted = sizes(target, ordered, length, objects, chunksz);
     
-    if(!(json = json_dumps(root, JSON_INDENT(4))))
-        dies("json failed");
+    printf("[+] checking local directory consistancy\n");
+    corrupted = chunks(target, ordered, length, chunksz, ochunks);
     
-    // clearing
-    json_decref(root);
-
-    free(ordered);
-    free((char *) id);
+    printf("[+] %d corrupted chunks found\n", corrupted);
     
-    return json;
+    return 0;
 }
